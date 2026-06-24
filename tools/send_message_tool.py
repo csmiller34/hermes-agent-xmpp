@@ -215,7 +215,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'xmpp:user@example.com', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
@@ -821,6 +821,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
     }
 
+    # XMPP message length limit from adapter constant
+    try:
+        from gateway.platforms.xmpp import MAX_MESSAGE_LENGTH as _XMPP_MAX_LENGTH
+        _MAX_LENGTHS[Platform.XMPP] = _XMPP_MAX_LENGTH
+    except Exception:
+        _MAX_LENGTHS[Platform.XMPP] = 4000
+
     # Check plugin registry for max_message_length
     if platform not in _MAX_LENGTHS:
         try:
@@ -1032,11 +1039,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- XMPP: native media attachment support via running gateway adapter ---
+    if platform == Platform.XMPP and media_files:
+        return await _send_xmpp_via_adapter(pconfig, chat_id, message, media_files=media_files)
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and whatsapp; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and xmpp; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -1044,7 +1055,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and whatsapp"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and xmpp"
         )
 
     last_result = None
@@ -1081,6 +1092,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_qqbot(pconfig, chat_id, chunk)
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
+        elif platform == Platform.XMPP:
+            # Prefer the live gateway adapter (with OMEMO) when available
+            result = await _send_via_adapter(platform, pconfig, chat_id, chunk)
+            if isinstance(result, dict) and result.get("error"):
+                # Fallback to standalone slixmpp (plaintext) if gateway not running
+                result = await _send_xmpp(pconfig, chat_id, chunk)
         else:
             # Plugin platform: route through the gateway's live adapter if
             # available, otherwise the plugin's standalone_sender_fn.
@@ -1956,6 +1973,171 @@ async def _send_yuanbao(chat_id, message, media_files=None):
         return await send_yuanbao_direct(adapter, chat_id, message, media_files=media_files)
     except Exception as e:
         return _error(f"Yuanbao send failed: {e}")
+
+
+async def _send_xmpp_via_adapter(pconfig, chat_id, message, media_files=None):
+    """Send via the live XMPP gateway adapter (with OMEMO, XEP-0363/0454 support).
+
+    Falls back to text-only standalone send if the gateway is not running.
+
+    Because the slixmpp client lives on the gateway's event loop, we must
+    schedule all adapter_coroutines on that loop rather than the current one
+    (which may be a _run_async worker).  We do this via
+    asyncio.run_coroutine_threadsafe + Future.result().
+    """
+    media_files = media_files or []
+
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        if not runner:
+            # No live adapter — fall back to text-only standalone send
+            from gateway.platforms.xmpp import MAX_MESSAGE_LENGTH
+            from gateway.platforms.base import BasePlatformAdapter
+            chunks = BasePlatformAdapter.truncate_message(message, MAX_MESSAGE_LENGTH)
+            last_result = None
+            for chunk in chunks:
+                last_result = await _send_xmpp(pconfig, chat_id, chunk)
+            return last_result
+
+        from gateway.config import Platform
+        adapter = runner.adapters.get(Platform.XMPP)
+        if not adapter:
+            # Adapter not connected — fall back to text-only standalone send
+            from gateway.platforms.xmpp import MAX_MESSAGE_LENGTH
+            from gateway.platforms.base import BasePlatformAdapter
+            chunks = BasePlatformAdapter.truncate_message(message, MAX_MESSAGE_LENGTH)
+            last_result = None
+            for chunk in chunks:
+                last_result = await _send_xmpp(pconfig, chat_id, chunk)
+            return last_result
+
+        # Determine which event loop the slixmpp client runs on.
+        # If we're already on that loop, we can await directly;
+        # otherwise we must schedule on the gateway loop to avoid
+        # "Future attached to a different loop" errors.
+        xmpp_client = getattr(adapter, "_client", None)
+        gateway_loop = getattr(xmpp_client, "loop", None) if xmpp_client else None
+
+        async def _do_send():
+            """Run on the gateway's event loop (or current loop if same)."""
+            last_result = None
+
+            # Send text first
+            if message.strip():
+                from gateway.platforms.base import SendResult
+                result = await adapter.send(chat_id=chat_id, content=message)
+                if not result.success:
+                    return {"error": f"XMPP send failed: {result.error}"}
+                last_result = result
+
+            # Send media files
+            for media_path, is_voice in media_files:
+                if not os.path.exists(media_path):
+                    return {"error": f"Media file not found: {media_path}"}
+
+                ext = os.path.splitext(media_path)[1].lower()
+                if ext in _IMAGE_EXTS:
+                    result = await adapter.send_image_file(chat_id, media_path)
+                elif ext in _VIDEO_EXTS:
+                    # XMPP doesn't have native video send; fall back to image/document
+                    result = await adapter.send_image_file(chat_id, media_path)
+                else:
+                    # For other file types, send as document-like attachment via OOB
+                    result = await adapter.send_image_file(chat_id, media_path)
+
+                if not result.success:
+                    return {"error": f"XMPP media send failed: {result.error}"}
+                last_result = result
+
+            if last_result is None:
+                return {"error": "No deliverable text or media remained after processing MEDIA tags"}
+
+            return {
+                "success": True,
+                "platform": "xmpp",
+                "chat_id": chat_id,
+                "message_id": getattr(last_result, "message_id", None),
+            }
+
+        # If we're on the gateway's loop already, just await.
+        # Otherwise, schedule on the gateway loop and block until done.
+        if gateway_loop is not None and not gateway_loop.is_closed():
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+
+            if gateway_loop is not current_loop:
+                # We're on a different (worker) loop — schedule on the
+                # gateway loop and block this thread until the result is ready.
+                future = asyncio.run_coroutine_threadsafe(_do_send(), gateway_loop)
+                try:
+                    return future.result(timeout=120)  # 120s for uploads
+                except Exception as e:
+                    return {"error": f"XMPP send failed: {e}"}
+
+        # Same loop or no gateway loop — await directly
+        return await _do_send()
+    except Exception as e:
+        return {"error": f"XMPP send failed: {e}"}
+
+
+async def _send_xmpp(pconfig, chat_id, message):
+    """Send via XMPP using an independent slixmpp client (no gateway required).
+
+    Uses the configured XMPP_JID and XMPP_PASSWORD from the environment
+    (already loaded into os.environ by the caller). Creates a one-shot
+    client, sends the message, disconnects, and returns the result.
+    """
+    try:
+        import slixmpp
+    except ImportError:
+        return {"error": "slixmpp not installed. Run: pip install slixmpp"}
+
+    jid = os.environ.get("XMPP_JID") or (pconfig.extra.get("jid") if pconfig and pconfig.extra else None)
+    password = os.environ.get("XMPP_PASSWORD") or (pconfig.extra.get("password") if pconfig and pconfig.extra else None)
+    if not jid or not password:
+        return {"error": "XMPP not configured (XMPP_JID and XMPP_PASSWORD required in ~/.hermes/.env)"}
+
+    class OneShotXMPP(slixmpp.ClientXMPP):
+        def __init__(self, jid, password, recipient, body):
+            super().__init__(jid, password)
+            self.recipient = recipient
+            self.body = body
+            self._done = asyncio.Event()
+            self.add_event_handler("session_start", self.on_start)
+            self.add_event_handler("disconnected", self.on_dc)
+            self.result = None
+
+        async def on_start(self, event):
+            self.send_presence()
+            self.get_roster()
+            self.send_message(mto=self.recipient, mbody=self.body, mtype='chat')
+            await asyncio.sleep(1)
+            self.disconnect()
+
+        async def on_dc(self, event):
+            self._done.set()
+
+        async def run(self):
+            self.register_plugin('xep_0030')
+            self.register_plugin('xep_0199')
+            await self.connect()
+            try:
+                await asyncio.wait_for(self._done.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                self.disconnect()
+            finally:
+                await asyncio.sleep(0.5)
+
+    try:
+        bot = OneShotXMPP(jid, password, chat_id, message)
+        await bot.run()
+        bot._done.clear()
+        return {"success": True, "platform": "xmpp", "chat_id": chat_id}
+    except Exception as e:
+        return _error(f"XMPP send failed: {e}")
 
 
 # --- Registry ---
