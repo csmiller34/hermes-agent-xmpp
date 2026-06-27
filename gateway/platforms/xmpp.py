@@ -207,7 +207,7 @@ class XmppAdapter(BasePlatformAdapter):
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self._jid or not self._password:
             logger.error("XMPP: JID or password not configured")
             return False
