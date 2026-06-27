@@ -88,6 +88,7 @@ class _HermesXMPPClient(slixmpp.ClientXMPP):
         self.register_plugin("xep_0066")
         self.register_plugin("xep_0198")
         self.register_plugin("xep_0249")
+        self.register_plugin("xep_0280")  # Message Carbons — echo to all user devices
         self.register_plugin("xep_0363")  # HTTP File Upload (images, audio, etc.)
 
         self._omemo_enabled = adapter._omemo_enabled
@@ -115,6 +116,12 @@ class _HermesXMPPClient(slixmpp.ClientXMPP):
         try:
             self.send_presence()
             await self.get_roster()
+            # Enable Message Carbons (XEP-0280) so outbound messages echo to all user devices
+            try:
+                self["xep_0280"].enable()
+                logger.info("XMPP: Message Carbons (XEP-0280) enabled")
+            except Exception as exc:
+                logger.warning("XMPP: failed to enable Message Carbons: %s", exc)
         except Exception as exc:
             logger.warning("XMPP: error during session start: %s", exc)
         # Fire-and-forget: warm the XEP-0363 upload-service cache so the first
