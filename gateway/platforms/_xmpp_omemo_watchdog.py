@@ -1,1 +1,2 @@
-fatal: path 'gateway/platforms/_xmpp_omemo_watchdog.py' exists on disk, but not in 'xmpp-fork/HEAD'
+# Placeholder — watchdog logic is inlined in xmpp.py (_start_watchdog/_stop_watchdog/_watchdog_loop)
+# This file exists for historical compatibility.
