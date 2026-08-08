@@ -639,6 +639,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-xmpp": {
+        "description": "XMPP messaging toolset - supports sending/receiving plain-text messages via slixmpp",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
