@@ -28,6 +28,7 @@ __all__ = [
     "SendResult",
     "QQAdapter",
     "YuanbaoAdapter",
+    "XmppAdapter",
 ]
 
 
@@ -38,6 +39,9 @@ def __getattr__(name):
     if name == "YuanbaoAdapter":
         from .yuanbao import YuanbaoAdapter  # noqa: F401
         return YuanbaoAdapter
+    if name == "XmppAdapter":
+        from .xmpp import XmppAdapter  # noqa: F401
+        return XmppAdapter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

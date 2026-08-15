@@ -345,6 +345,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    XMPP = "xmpp"
     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
     @classmethod
     def _missing_(cls, value):
@@ -903,6 +904,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     ),
     Platform.YUANBAO: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("app_secret")
+    ),
+    Platform.XMPP: lambda cfg: bool(
+        cfg.extra.get("jid") or os.getenv("XMPP_JID")
     ),
     # Relay dials OUT to a connector; it is "connected" once an endpoint URL is
     # configured (extra["relay_url"] or extra["url"]). The capability descriptor
@@ -2567,6 +2571,37 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_group_allow_from = getenv("YUANBAO_GROUP_ALLOW_FROM")
         if yuanbao_group_allow_from:
             extra["group_allow_from"] = yuanbao_group_allow_from
+
+    # XMPP
+    xmpp_jid = getenv("XMPP_JID")
+    xmpp_password = getenv("XMPP_PASSWORD")
+    if xmpp_jid:
+        if Platform.XMPP not in config.platforms:
+            config.platforms[Platform.XMPP] = PlatformConfig()
+        config.platforms[Platform.XMPP].enabled = True
+        extra = config.platforms[Platform.XMPP].extra
+        extra["jid"] = xmpp_jid
+        if xmpp_password:
+            extra["password"] = xmpp_password
+        xmpp_server = getenv("XMPP_SERVER")
+        if xmpp_server:
+            extra["server"] = xmpp_server
+        xmpp_port = getenv("XMPP_PORT")
+        if xmpp_port:
+            try:
+                extra["port"] = int(xmpp_port)
+            except ValueError:
+                pass
+        xmpp_home = getenv("XMPP_HOME_CHANNEL")
+        if xmpp_home:
+            config.platforms[Platform.XMPP].home_channel = HomeChannel(
+                platform=Platform.XMPP,
+                chat_id=xmpp_home,
+                name=getenv("XMPP_HOME_CHANNEL_NAME", "Home"),
+            )
+        xmpp_allowed = getenv("XMPP_ALLOWED_USERS")
+        if xmpp_allowed:
+            extra["allow_from"] = xmpp_allowed
 
     # Session settings
     idle_minutes = getenv("SESSION_IDLE_MINUTES")
